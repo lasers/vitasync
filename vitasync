@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# author: lasers
+trap "echo; exit" INT
+
+# shellcheck disable=2034
+function set_colors() {
+    RESET="$(tput sgr0)"
+    BLACK="$(tput setaf 0)"
+    RED="$(tput setaf 1)"
+    GREEN="$(tput setaf 2)"
+    YELLOW="$(tput setaf 3)"
+    BLUE="$(tput setaf 4)"
+    MAGENTA="$(tput setaf 5)"
+    CYAN="$(tput setaf 6)"
+    WHITE="$(tput setaf 7)"
+    GRAY="$(tput setaf 8)"
+    LIGHT_RED="$(tput setaf 9)"
+    LIGHT_GREEN="$(tput setaf 10)"
+    LIGHT_YELLOW="$(tput setaf 11)"
+    LIGHT_BLUE="$(tput setaf 12)"
+    LIGHT_MAGENTA="$(tput setaf 13)"
+    LIGHT_CYAN="$(tput setaf 14)"
+    LIGHT_WHITE="$(tput setaf 15)"
+    LIGHT_GRAY="$(tput setaf 16)"
+}
+set_colors
+
+error() {
+    echo -e "${LIGHT_RED}[ ERROR ][ ]${RESET} ${1}" >&2
+    if [ "${2}" ]; then
+        exit "${2}"
+    fi
+}
+
+BINARIES=(curl dos2unix du find mktemp pkg2zip realpath rsync sha256sum tar tput tree unzip)
+for BIN in "${BINARIES[@]}"; do
+    if ! command -v "${BIN}" > /dev/null 2>&1; then
+        error "${BIN}: command not found." 1
+    fi
+done
+
+function populate_psv_tsv() {
+    local URL="https://nopaystation.com/tsv"
+    local LIST=("PSV_GAMES" "PSV_DLCS" "PSV_UPDATES" "PSV_THEMES")
+    local NAME="PSV_TSVs"
+
+    local DIR="${TEMP_DIR}/${NAME}"
+    local EXT=".tar.xz"
+    local HEADER="[  PSV  ][*]"
+    TSV_FILE="${DIR}${EXT}"
+
+    if [ -f "${TSV_FILE}" ]
+    then
+        echo -e "${YELLOW}${HEADER}${RESET} File ${GRAY}${TEMP_DIR}/${YELLOW}${NAME}${EXT}${RESET} already exists... Skipping..."
+    else
+        mkdir -p "${DIR}"
+        for i in "${LIST[@]}"
+        do
+            echo -e "${YELLOW}${HEADER}${RESET} Downloading ${YELLOW}${i}$RESET.tsv... to ${GRAY}${DIR}${RESET}"
+            curl -s "${URL}/${i}.tsv" -o "${DIR}/${i}.tsv"
+            dos2unix -q "${DIR}/${i}.tsv"
+        done
+
+        echo -e "${YELLOW}${HEADER}${RESET} Compressing ${YELLOW}TSV Files${RESET} to ${GRAY}${TEMP_DIR}/${YELLOW}${NAME}${EXT}${RESET}"
+        (cd "${DIR}" && tar cJf "${TSV_FILE}" -- *.tsv)
+        rm -rf "${DIR}"
+    fi
+}
+
+show_help() {
+    echo "Usage: [OPTION]..."
+    echo "  vitasync is an non-interactive bash script using curl, dos2unix,"
+    echo "  pkg2zip, rsync, sha256sum, unzip, and other tools to make it easy"
+    echo "  to keep your folder synchronized with offline content and updates."
+    echo ""
+    echo "Arguments"
+    echo "  -c, --content DIR  (example: ~/Content)"
+    echo "  -u, --updates DIR  (example: ~/Updates)"
+    echo "  -X, --extract DIR  (example: ~/Extracted)"
+    echo "  -f, --filter STR   (example: \"nice bird\")"
+    # debug
+    # echo "  --tmpdir DIR       (default: \""${TEMP_DIR}"\")"
+    # echo "  --cachedir NAME    (default: \""${CACHE_NAME}"\")"
+    # echo "  --verbose          (show more processing)"
+    echo "  -h, --help         (show this for options)"
+    echo "  --sync             (sync contents & updates)"
+    exit
+}
+
+TEMP_DIR="/tmp/vitasync-weekly-cache-$(date -u "+%U")"
+CACHE_NAME="vitasync"
+EXTRACT_DIR=
+FILTER=
+FSYNC=
+VERBOSE=
+UNZIP="-n -q"
+PKG2ZIP="-q"
+RSYNC=
+SYNC=
+
+declare -A LOOP_FILES
+declare -A LOOP_DIRS
+
+while true ; do
+  case "${1}" in
+    -h|--help)
+        show_help
+        ;;
+
+    -c|--content|-u|--updates)
+        [[ "${1}" == "-c" ]] || [[ "${1}" == "--content" ]] && ID="CONTENT"
+        [[ "${1}" == "-u" ]] || [[ "${1}" == "--updates" ]] && ID="UPDATES"
+
+        DIR="$(realpath --canonicalize-missing "${2}")"
+        if [ -d "${DIR}" ]; then
+            LOOP_DIRS+=(["${DIR}"]="${ID}")
+            UPDATE_DIR+=("${DIR}")
+            mapfile -d $'\0' array < <(find "${DIR}" -maxdepth 1 \( -iname "*.zip" -o -iname "*.pkg" \) -print0)
+
+            for TEMP in "${array[@]}"; do
+                LOOP_FILES+=(["${TEMP}"]="${ID}")
+            done
+
+            shift
+        else
+            error "Not a directory ${2}" 1
+        fi
+        ;;
+
+    -X|--extract)
+        DIR="$(realpath --canonicalize-missing "${2}")"
+        if [ -d "${DIR}" ]; then
+            EXTRACT_DIR="${DIR}"
+            shift
+        else
+            error "Not a directory ${2}" 1
+        fi
+        ;;
+
+    -f|--filter)
+        FILTER="${2}"
+        shift
+        ;;
+    --sync)
+        SYNC=true
+        ;;
+
+    --tmpdir)
+        # Hidden - Useful for debugging
+        DIR="$(realpath --canonicalize-missing "${2}")"
+        if [ -d "${DIR}" ]; then
+            # overwrite TEMP_DIR
+            TEMP_DIR="${DIR}"
+            shift
+        else
+            error "Not a directory ${2}" 1
+        fi
+        ;;
+
+    --cachedir)
+        # Hidden - Useful for debugging
+        # Avoid -C to avoid potential confusion with -c.
+        if [[ "${2}" =~ ^[[:alpha:]]*$ ]]; then
+            # overwrite CACHE_NAME
+            CACHE_NAME="${2}"
+            shift
+        else
+            error "Not a directory ${2}" 1
+        fi
+        ;;
+
+    --verbose)
+        # Hidden - Make things a bit more verbose.
+        VERBOSE=true
+        PKG2ZIP=
+        RSYNC="-v"
+        ;;
+
+    --)
+        shift
+        break
+        ;;
+
+     *)
+        break
+
+  esac
+  shift
+done
+
+if [ "${#LOOP_DIRS[@]}" -eq 0 ]; then
+    if [ ! "${EXTRACT_DIR}" ]; then
+        error "Missing argument [-c|--content] [-u|--updates] [-X|--extract]" 1
+    else
+        error "Missing argument [-X|--extract]" 1
+    fi
+elif [ ! "${EXTRACT_DIR}" ]; then
+    error "Missing argument [-X|--extract]" 1
+fi
+
+if [ "${VERBOSE}" ];then
+    for ID in "CONTENT" "UPDATES"; do
+        echo "${BLUE}[${ID}]${RESET}"
+        for DIR in "${!LOOP_DIRS[@]}"; do
+            [[ "${LOOP_DIRS[${DIR}]}" == "${ID}" ]] && echo "[*] ${DIR}"
+        done
+    done
+
+    echo -e "${BLUE}[EXTRACT]${RESET}\n[*] ${EXTRACT_DIR}"
+    echo -e "${BLUE}[ TEMP  ]${RESET}\n[*] ${TEMP_DIR}"
+    echo ""
+fi
+
+# inits
+CACHE_DIR="${EXTRACT_DIR}/${CACHE_NAME}"
+mkdir -p "${CACHE_DIR}"
+
+populate_psv_tsv
+
+for LOOP_FILE in "${!LOOP_FILES[@]}"; do
+    EXTENSION="${LOOP_FILE##*.}"
+    if [[ "${EXTENSION}" == "zip" ]]; then
+        # skip zipped non-pkgs/non-single-pkg just in case
+        PKG="$(unzip -Z -1 "${LOOP_FILE}")"
+        COUNT="$(echo "${PKG}" | wc -l)"
+        if [[ "$PKG" != *.pkg ]] || [[ "${COUNT}" -ne 1 ]]; then
+            continue
+        fi
+    else
+        PKG="$(basename "${LOOP_FILE}")"
+    fi
+
+    # FILTER
+    SKIP_FILE=true
+    for LOOP_FILTER in "${LOOP_FILE}" "${PKG}"; do
+        if [[ "${LOOP_FILTER}" == *"${FILTER}"* ]]; then
+            SKIP_FILE=
+            break
+        fi
+    done
+    if [[ -n "${SKIP_FILE}" ]]; then
+        continue
+    fi
+
+    # get file name, game name, type
+    FILE_NAME="$(basename "${LOOP_FILE}")"
+    TYPE="${LOOP_FILES[${LOOP_FILE}]}"
+
+    if [[ "${TYPE}" == "CONTENT" ]]; then
+        COLOR="${MAGENTA}"
+    else
+        COLOR="${LIGHT_GREEN}"
+    fi
+
+    INITIAL="${COLOR}[${TYPE:0:1}]"
+    DIR_NAME="$(dirname "${LOOP_FILE}")"
+    echo -e "${YELLOW}[  PKG  ]${COLOR}${INITIAL}${RESET} File ${GRAY}${DIR_NAME}/${LIGHT_YELLOW}${FILE_NAME}${RESET}..."
+
+    if [[ ! -n "${SYNC}" ]]; then
+        continue
+    fi
+
+    # get pkg_link, pkg_sha256
+    PKG_NAME="${PKG%.*}"
+    if [[ "${EXTENSION}" == "pkg" ]]; then
+        PKG_SHA256="sha256-$(sha256sum "${LOOP_FILE}" | cut -d' ' -f1)"
+    elif [[ "${EXTENSION}" == "zip" ]]; then
+        PKG_SHA256="sha256-$(unzip -p "${LOOP_FILE}" | sha256sum | cut -d' ' -f1)"
+    fi
+
+    # look for cache first
+    GAME_NAME="${FILE_NAME%.*}"
+    TEMP="$(echo "${TYPE}" | tr "[:upper:]" "[:lower:]")"
+    CACHE="${CACHE_DIR}/${TEMP}"
+    CACHE_GREP="$(grep -xs "${PKG_SHA256}" "${CACHE}")"
+    if [ "${CACHE_GREP}" ]; then
+        echo -e "${LIGHT_YELLOW}[ CACHE ]${COLOR}${INITIAL}${RESET} └── Cache ${GRAY}${CACHE}:${LIGHT_YELLOW}${PKG_SHA256}${RESET} already exists... Skipping..."
+        continue
+    fi
+
+    # cut fields
+    LINE="$(xzgrep -a "${PKG_NAME}" "${TSV_FILE}")"
+    if [[ "${TYPE}" == "UPDATES" ]]; then
+        ZRIF=
+        SHA256="$(echo "${LINE}" | cut -f9)"
+    elif [[ "${FILE_NAME}" == *"(DLC)"* ]] || [[ "${FILE_NAME}" == *"(Theme)"* ]]; then
+        # dlc/theme
+        ZRIF="$(echo "${LINE}" | cut -f5)"
+        SHA256="$(echo "${LINE}" | cut -f9)"
+    else
+        # content
+        ZRIF="$(echo "${LINE}" | cut -f5)"
+        SHA256="$(echo "${LINE}" | cut -f10)"
+    fi
+    [[ "${SHA256}" ]] && SHA256="sha256-${SHA256}"
+
+    if [ "${VERBOSE}" ]; then
+        echo ""
+        echo "  ┌── LOOP_FILE  : ${LOOP_FILE}"
+        echo "  ├── FILE_NAME  : ${FILE_NAME}"
+        echo "  ├── PKG        : ${PKG}"
+        echo "  ├── PKG_SHA256 : ${PKG_SHA256}"
+        echo "  ├── SHA256     : ${SHA256}"
+        [[ "${ZRIF}" ]] && echo "  ├── ZRIF       : ${ZRIF}"
+        echo "  │"
+    fi
+
+    # parse tsv first before extracing, processing, et cetera
+    if [ "${ZRIF}" = "MISSING" ]; then
+        error "└── zRIF key for ${LIGHT_RED}${PKG}${RESET} doesn't exist... Skipping..."
+        continue
+    elif [ -n "${SHA256}" ]; then
+        # checksum first before unzipping
+        if [ "${PKG_SHA256}" != "${SHA256}" ]; then
+            echo "└── Checksum for ${LIGHT_RED}${PKG}${RESET} does not match the list..."
+            while true
+            do
+                echo "Continue? (yes/no)"
+                read -r INPUT
+                case "${INPUT}" in
+                    Yes|YES|yes|Y|y) break ;;
+                    No|NO|no|n) error "User aborted." 1 ;;
+                esac
+            done
+        fi
+    else
+        error "└── Checksum for ${LIGHT_RED}${PKG}${RESET} does not exist... Skipping..."
+        continue
+    fi
+
+    # unzip/copy a file
+    if [[ "${EXTENSION}" == "zip" ]]; then
+        CLEANUP_STRING=" └── Deleting pkg "
+        echo -e "${GREEN}[ UNZIP ]${COLOR}${INITIAL}${RESET} └── Unzipping ${GRAY}${TEMP_DIR}..."
+        unzip ${UNZIP} "${LOOP_FILE}" -d "${TEMP_DIR}"
+    elif [[ "${EXTENSION}" == "pkg" ]]; then
+        CLEANUP_STRING=" └── Removing link "
+        echo -e "${GREEN}[LINKING]${COLOR}${INITIAL}${RESET} └── Softlinking \"${GRAY}${TEMP_DIR}/${GREEN}${GAME_NAME}${RESET}\"..."
+        ln -sf "${LOOP_FILE}" "${TEMP_DIR}/"
+    fi
+
+    # mkcd a directory
+    echo -e "${GREEN}[EXTRACT]${COLOR}${INITIAL}${RESET} └── Extracting ${GRAY}${TEMP_DIR}/${GREEN}${PKG}${RESET}..."
+    mkdir -p "${TEMP_DIR}/${GAME_NAME}" && cd "${TEMP_DIR}/${GAME_NAME}" && pkg2zip ${PKG2ZIP} -x "${TEMP_DIR}/${PKG}" "${ZRIF}"
+
+    # rsynchronize
+    BASE_NAME="$(basename "${EXTRACT_DIR}")"
+    DIR_NAME="$(dirname "${EXTRACT_DIR}")"
+    echo -e "${LIGHT_YELLOW}[ RSYNC ]${COLOR}${INITIAL}${RESET} └── Synchronizing ${GRAY}${TEMP_DIR}/${GREEN}${GAME_NAME}${RESET}... to ${GRAY}${DIR_NAME}/${RESET}${BASE_NAME}..."
+    rsync $RSYNC --inplace --no-whole-file -a "${TEMP_DIR}/${GAME_NAME}/" "${EXTRACT_DIR}"
+    echo -e "${LIGHT_YELLOW}[ CACHE ]${COLOR}${INITIAL}${RESET} └── Adding cache ${GRAY}${CACHE}:${LIGHT_YELLOW}${PKG_SHA256}${RESET}..."
+    echo "${PKG_SHA256}" >> "${CACHE}" && sort -u -o "${CACHE}" "${CACHE}"
+
+    # cleanup
+    cd "${TEMP_DIR}" || error "${TEMP_DIR} temp_dir not found." 1
+    echo -e "${BLUE}[CLEANUP]${COLOR}${INITIAL}${RESET}${CLEANUP_STRING}${GRAY}${TEMP_DIR}/${BLUE}${PKG}${RESET}..."
+    rm "${TEMP_DIR}/${PKG}"
+
+    echo -e "${BLUE}[CLEANUP]${COLOR}${INITIAL}${RESET} └── Deleting directory ${GRAY}${TEMP_DIR}/${BLUE}${GAME_NAME}${RESET}..."
+    rm -rf "${TEMP_DIR}/${GAME_NAME}"
+
+    FSYNC=true
+done
+
+if [[ -n "${FSYNC}" ]]; then
+    echo -e "${CYAN}[ FSYNC ][*]${RESET} Synchronizing cached writes to persistent storage... ${RED}Please be patient${RESET}..."
+    sync
+    DU="$(du -hLs "${EXTRACT_DIR}" | cut -f1)"
+    TREE="$(tree "${EXTRACT_DIR}" | tail -n1)"
+    echo -e "${CYAN}[ FSYNC ][*]${RESET} Synchronizing cached writes to persistent storage completed."
+    echo -e "${CYAN}[ FSYNC ][*]${RESET} Extracted dir ${GRAY}${EXTRACT_DIR}"
+    echo -e "${CYAN}[ FSYNC ][*]${RESET} Total stats ${GRAY}${TREE}, ${DU}${RESET}"
+fi
